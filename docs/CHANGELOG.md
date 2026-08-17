@@ -1,0 +1,15 @@
+# CHANGELOG
+
+Tài liệu ghi nhận lịch sử xử lý sự cố, fix lỗi và cải tiến tính năng trong repository. Mục mới nhất nằm ở đầu file.
+
+---
+
+### [2026-08-17] Hoàn thành toàn bộ Lab 17 (3 nhiệm vụ cốt lõi + 2 bài mở rộng A & B)
+
+| Lỗi / Vấn đề | Nguyên nhân gốc | Giải pháp thực hiện |
+|---|---|---|
+| **`gold_training_set` nhân bản số hàng** sau mỗi lần chạy pipeline / backfill Airflow (12.480 → 24.960 → 37.440...) | Model incremental thiếu khai báo `unique_key` và `incremental_strategy`, dbt mặc định dùng `append` (`INSERT INTO`). Nguồn CDC có `op = 'u'` ở nhiều ngày khiến 1 ticket lọt qua bộ lọc ngày nhiều lần và bị nhân bản. | 1. Cấu hình `unique_key = 'ticket_id'` và `incremental_strategy = 'merge'` trong `gold_training_set.sql`.<br>2. Cấu hình `catchup=False` và `max_active_runs=1` trong `ai_training_pipeline.py`. |
+| **`gold_feature_daily` thiếu 455 hàng** ở các ngày quá khứ (đạt 8.645 / 9.100 hàng) | Model incremental lọc `where event_date > (select max(event_date) from {{ this }})` nên bỏ sót các sự kiện phát sinh trong quá khứ bị chuyển về kho muộn (late-arriving data do P99 độ trễ là ~2,68 ngày). | 1. Nới lookback window lùi 3 ngày: `where event_date >= (select max(event_date) from {{ this }}) - interval 3 day`.<br>2. Cấu hình `unique_key = ['event_date', 'customer_id']` và `incremental_strategy = 'merge'`. |
+| **`silver_tickets.priority` xuất hiện NULL và sai contract** kể từ ngày 2026-08-10 | Upstream đổi schema biểu diễn priority từ số (`1..4`) sang nhãn chữ (`urgent/high/medium/low`), làm `try_cast(col as integer)` trả về `NULL`. Đồng thời lẫn dữ liệu lỗi thực sự (`0, 5, -1, unknown, P1`). | 1. Sửa macro `normalize_priority.sql` map chuỗi sang số 1..4, trả `NULL` cho dữ liệu lỗi.<br>2. Lọc bản ghi hợp lệ trước khi `row_number()` trong `silver_tickets.sql` để không mất ticket.<br>3. Thu gom 312 bản ghi CDC lỗi vào `quarantine_tickets.sql`.<br>4. Bật `enforced: true` và thêm test `accepted_values: [1..4]` trong `schema.yml`. |
+| **Truy vấn Dashboard CSKH chạy chậm (38-110s)** do small-file problem (5.000 file Parquet nhỏ) | Dữ liệu bị phân mảnh 5.000 file không partition. Truy vấn dùng `strftime(event_time, '%Y-%m-%d') = '2026-08-09'` bọc cột trong function khiến engine không áp dụng được partition pruning và row group stats. | 1. Viết `tools/compact.py` gom file, `PARTITION_BY (event_date)`, `ORDER BY customer_name, event_time`, `ROW_GROUP_SIZE 2000`.<br>2. Viết lại `queries/dashboard.sql` dùng `read_parquet(..., hive_partitioning = true)` và sargable filter `event_date = '2026-08-09'`. (Giảm rows scanned từ 5M xuống 137k - 36,4×, thời gian còn 12,9 ms). |
+| **Consumer mất dữ liệu khi bị kill giữa chừng** (`make crash-test`) | Consumer vận hành theo `at-most-once` (commit offset trước, ghi đĩa sau). Khi crash ở batch 7, offset đã tăng nhưng dữ liệu chưa ghi, restart bị bỏ qua batch đó. | 1. Đặt `PRIMARY KEY` cho `event_id` trong bảng `bronze_events_stream`.<br>2. `write_batch()` dùng `INSERT ... ON CONFLICT (event_id) DO UPDATE SET ...` đảm bảo idempotent.<br>3. `consume()` đảo thứ tự: ghi đĩa trước (`write_batch`), commit offset sau (`consumer.commit()`), chuyển sang `at-least-once`. |
